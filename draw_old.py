@@ -30,7 +30,7 @@ TBRK = 2
 POD  = 3
 PODW = 4
 
-def create_draw(players, results, rounds, mode='production', pod_size=8, minimiseTiebreakDist=False, seed=231):
+def create_draw(players, results, rounds, mode='production', pod_size=8, minimiseTiebreakDist=False):
     """
     Create draw for the round
     Parameters
@@ -59,9 +59,6 @@ def create_draw(players, results, rounds, mode='production', pod_size=8, minimis
     pairs: The list form of pairing allocations
         (n / 2 x (2, 2, 1)) list containing [(player_a_standing, player_a_id), (player_b_standing, player_b_id), pod]
     """
-    if seed:
-        np.random.seed(seed=seed)
-    
     n_players = len(players)
 
     standings               = get_standings(players, results, rounds, pod_size)
@@ -263,7 +260,7 @@ def get_allocations(standings, scores, mode):
 
     # Run Gibbs Sampler, and return if it hit max result
     allocs_gs, pairs_gs = _gibbs_sampler(standings, scores)
-    if scores[allocs_gs==1].mean(dtype=float) == max_score:
+    if scores[allocs_gs==1].mean() == max_score:
         return allocs_gs, pairs_gs, splits
 
     # Otherwise run Metropolis-Hastings Sampler
@@ -286,10 +283,100 @@ def get_allocations(standings, scores, mode):
     allocs_mh, pairs_mh = _gibbs_sampler(standings, scores, alloc=allocs)
 
     # Return the better of Gibbs or Metropolis Hastings
-    if(scores[allocs_mh==1].mean(dtype=float) >= scores[allocs_gs==1].mean(dtype=float)):
+    if(scores[allocs_mh==1].mean() >= scores[allocs_gs==1].mean()):
         return allocs_mh, pairs_mh, splits
     else:
         return allocs_gs, pairs_gs, splits
+
+def _metroplis_hastings(standings, scores, start=0):
+    """
+    Allocate player pairings using MH probability method
+    Parameters
+    ----------
+    standings: List of standings for all players still in the tournament
+        (n x 4) list containing [player_id, player_wins, pod_id, player_wins_in_pod]
+    scores: Matrix containing the scores for all possible pairings
+        (n x n) matrix of floats
+    Returns
+    -------
+    alloc: The matrix form pairing allocations
+        (n x n) matrix of integers
+    pairs: The list form of pairing allocations
+        (n / 2 x (2, 2, 1)) list containing [(player_a_standing, player_a_id), (player_b_standing, player_b_id), pod]
+    """
+    n_players = len(standings)
+    ix = {pos+start: player_id for pos, player_id in enumerate(standings[:,PID])}
+    alloc = np.zeros((n_players, n_players), dtype=int)
+    pods = {player[PID]: player[POD] for player in standings}
+
+    # Construct initial draw
+    constraints = scores.astype(int) == scores.astype(int).max(axis=1, keepdims=True)
+    constraints = n_players - constraints.sum(axis=1)
+    prob = scores - scores.max(axis=1, keepdims=True)
+    prob = np.exp(prob.astype(np.float32)/4)
+
+    for _ in range(int(n_players / 2)):
+        mask = (1 - alloc.sum(axis=1))
+        # Choose Player A
+        a = (constraints * mask).argmax()
+        # Choose Player B
+        p = scores[a][mask == 1]
+        p = p - p.max()
+        p = np.exp(p.astype(np.float32)/4)
+        p = p / p.sum()
+        b = np.random.choice(np.arange(n_players)[mask == 1], p=p)
+        #print(a, '(', standings[a][1], ')', b, '(', standings[b][1], ')')
+
+        alloc[a, b] = 1
+        alloc[b, a] = 1
+
+    brackets = [n for n in range(n_players) if (standings[n,[WINS]] != standings[n-1,[WINS]]).any()] + [n_players]
+    n_odd_brackets = sum(np.array(brackets) % 2)
+    max_score = Points.valid  - 2 * n_odd_brackets * (Points.valid + Points.overall_win_distance) / n_players
+
+    # Run Metropolis-Hastings to iteratively improve draw
+    score_q = [(alloc*scores).sum()/len(scores)]
+    if score_q[0] != max_score:
+        prob /= prob.sum(axis=1, keepdims=True)
+
+        best_alloc = alloc.copy()
+        while len(score_q) < 100 or np.mean(score_q[-10:]) > np.mean(score_q[-20:-10]):
+            #print('---', len(score_q), '---')
+            if max(score_q) == max_score:
+                break
+            if len(score_q) > 10 and min(score_q[-10:]) == max(score_q[-10:]):
+                break
+            for a, p in enumerate(prob):
+                b = alloc[a].argmax()
+                c = np.random.choice(range(len(p)),p=p)
+                d = alloc[c].argmax()
+                p_change = prob[a,c]*prob[b,d]/(prob[a,b]*prob[c,d] + prob[a,c]*prob[b,d])
+                if np.random.random() < p_change:
+                    alloc = swap_pairs((a,b), (c,d), alloc)
+                #    print(a, '(', standings[a][1], ')', b, '(', standings[b][1], ')')
+                #else:
+                #    print(a, '(', standings[a][1], ')', c, '(', standings[c][1], ')')
+
+            score = (alloc*scores).sum()/len(prob)
+            if score > max(score_q):
+                best_alloc = alloc.copy()
+            score_q.append(score)
+
+        alloc = best_alloc
+        del(best_alloc)
+
+    #if max_score > max(score_q): print("***", len(score_q), max_score, max(score_q), "***")
+    #if len(score_q) > 1: print(["%.2f" % v for v in score_q])
+    # Create list form of pairings
+    alloc_ = alloc * np.tri(*alloc.shape)
+
+    pairs = []
+    for n in range(n_players):
+        if alloc_[n].max() == 1:
+            a, b = n + start, alloc_[n].argmax() + start
+            pairs.append([(a, ix[a]), (b, ix[b]), pods[ix[a]]])
+
+    return alloc, pairs
 
 def _gibbs_sampler(standings, scores, start=0, alloc=None):
     """
@@ -379,91 +466,6 @@ def _gibbs_sampler(standings, scores, start=0, alloc=None):
         b = alloc[a].argmax()
         if a < b:
             a, b = a + start, b + start
-            pairs.append([(a, ix[a]), (b, ix[b]), pods[ix[a]]])
-
-    return alloc, pairs
-
-def _metroplis_hastings(standings, scores, start=0):
-    """
-    Allocate player pairings using MH probability method
-    Parameters
-    ----------
-    standings: List of standings for all players still in the tournament
-        (n x 4) list containing [player_id, player_wins, pod_id, player_wins_in_pod]
-    scores: Matrix containing the scores for all possible pairings
-        (n x n) matrix of floats
-    Returns
-    -------
-    alloc: The matrix form pairing allocations
-        (n x n) matrix of integers
-    pairs: The list form of pairing allocations
-        (n / 2 x (2, 2, 1)) list containing [(player_a_standing, player_a_id), (player_b_standing, player_b_id), pod]
-    """
-    n_players = len(standings)
-    ix = {pos+start: player_id for pos, player_id in enumerate(standings[:,PID])}
-    alloc = np.zeros((n_players, n_players), dtype=int)
-    pods = {player[PID]: player[POD] for player in standings}
-
-    # Construct initial draw
-    constraints = scores.astype(int) == scores.astype(int).max(axis=1, keepdims=True)
-    constraints = n_players - constraints.sum(axis=1)
-    prob = scores - scores.max(axis=1, keepdims=True)
-    prob = np.exp(prob.astype(np.float32)/4)
-
-    for _ in range(int(n_players / 2)):
-        mask = (1 - alloc.sum(axis=1))
-        # Choose Player A
-        a = (constraints * mask).argmax()
-        # Choose Player B
-        p = scores[a][mask == 1]
-        p = p - p.max()
-        p = np.exp(p.astype(np.float32)/4)
-        p = p / p.sum()
-        b = np.random.choice(np.arange(n_players)[mask == 1], p=p)
-
-        alloc[a, b] = 1
-        alloc[b, a] = 1
-
-    brackets = [n for n in range(n_players) if (standings[n,[WINS]] != standings[n-1,[WINS]]).any()] + [n_players]
-    n_odd_brackets = sum(np.array(brackets) % 2)
-    max_score = Points.valid  - 2 * n_odd_brackets * (Points.valid + Points.overall_win_distance) / n_players
-
-    # Run Metropolis-Hastings to iteratively improve draw
-    score_q = [(alloc*scores).sum()/len(scores)]
-    if score_q[0] != max_score:
-        prob /= prob.sum(axis=1, keepdims=True)
-
-        best_alloc = alloc.copy()
-        i = 0
-        while len(score_q) < 100 or np.mean(score_q[-10:]) > np.mean(score_q[-20:-10]):
-            i += 1
-            if max(score_q) == max_score:
-                break
-            if len(score_q) > 10 and min(score_q[-10:]) == max(score_q[-10:]):
-                break
-            for a, p in enumerate(prob):
-                b = alloc[a].argmax()
-                c = np.random.choice(range(len(p)),p=p)
-                d = alloc[c].argmax()
-                p_change = prob[a,c]*prob[b,d]/(prob[a,b]*prob[c,d] + prob[a,c]*prob[b,d])
-                if np.random.random() < p_change:
-                    alloc = swap_pairs((a,b), (c,d), alloc)
-
-            score = (alloc*scores).sum()/len(prob)
-            if score > max(score_q):
-                best_alloc = alloc.copy()
-            score_q.append(score)
-
-        alloc = best_alloc
-        del(best_alloc)
-
-    # Create list form of pairings
-    alloc_ = alloc * np.tri(*alloc.shape)
-
-    pairs = []
-    for n in range(n_players):
-        if alloc_[n].max() == 1:
-            a, b = n + start, alloc_[n].argmax() + start
             pairs.append([(a, ix[a]), (b, ix[b]), pods[ix[a]]])
 
     return alloc, pairs
