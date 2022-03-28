@@ -26,9 +26,12 @@ class Points():
 BYE  = 0
 PID  = 0
 WINS = 1
-TBRK = 2
+CTB  = 2
 POD  = 3
 PODW = 4
+PML  = 5
+OML  = 6
+OCTB = 7
 
 def create_draw(players, results, rounds, mode='production', pod_size=8, minimiseTiebreakDist=False, seed=231):
     """
@@ -95,9 +98,11 @@ def get_standings(players, results, rounds, pod_size=8, this_round=None, minimis
         this_round  = 0 if len(results) == 0 else np.array(results)[:,3].astype(int).max() + 1
     last_round        = this_round - 1
     win_history       = defaultdict(lambda: np.zeros(max(1, this_round), dtype=int))
+    loss_history      = defaultdict(lambda: np.zeros(max(1, this_round), dtype=int))
     pod_standings     = defaultdict(int)
     pods              = defaultdict(lambda: 1)
     active_players    = set([player[0] for player in players])
+    id_to_pos         = dict()
 
     # Use all rounds for pod standing if 'swiss', or just pod results if 'pod'
     same_format = set([n for n, rnd in enumerate(rounds) if rnd == rounds[this_round]])
@@ -105,8 +110,10 @@ def get_standings(players, results, rounds, pod_size=8, this_round=None, minimis
     # Calculate player standings
     if len(results) > 0:
         for a, b, winner, rnd, pod in results:
-            win_history[a][rnd] += (a == winner)
-            win_history[b][rnd] += (b == winner)
+            win_history[a][rnd]  += (a == winner)
+            win_history[b][rnd]  += (b == winner)
+            loss_history[a][rnd] += (b == winner)
+            loss_history[b][rnd] += (a == winner)
             if rnd in same_format:
                 pod_standings[a] += (a == winner)
                 pod_standings[b] += (b == winner)
@@ -114,17 +121,30 @@ def get_standings(players, results, rounds, pod_size=8, this_round=None, minimis
                 if a in active_players: pods[a] = pod
                 if b in active_players: pods[b] = pod
 
-    # Generate weightings for tiebreakers
+    # Calculate tiebreakers
     w = 0.25 ** np.arange(max(1, this_round))
     w = w.cumsum()[::-1]
 
-    standings = np.zeros((len(active_players), 5), dtype=object)
+    standings = np.zeros((len(active_players), 8), dtype=object)
     for n, p in enumerate(active_players):
+        id_to_pos[p] = n
         standings[n,PID]  = p
         standings[n,WINS] = win_history[p].sum()
-        standings[n,TBRK] = (w*win_history[p]).sum() / w.sum()
+        # Calculate cumulative tiebreakers (CTB)
+        standings[n,CTB] = (w*win_history[p]).sum() / w.sum()
+        # Calculate player match loss (PML)
+        standings[n,PML] = (loss_history[p]).mean()
 
-    standings = sort(standings, [WINS], [-1], preshuffle=True)
+    # Calculate opponent match loss (OML)
+    for result in results:
+        player1, player2 = id_to_pos[result[0]], id_to_pos[result[1]]
+        standings[player1, OML]  += standings[player2, PML] / this_round
+        standings[player2, OML]  += standings[player1, PML] / this_round
+        standings[player1, OCTB] += standings[player2, CTB] / this_round
+        standings[player2, OCTB] += standings[player1, CTB] / this_round
+
+    standings = sorted(standings, key=lambda x: [-x[WINS], -x[CTB], x[PML], x[OML], -x[OCTB]])
+    standings = np.array(standings)
 
     # Determine whether to create, reuse or ignore pods
     if rounds[this_round][:3] == 'pod':
@@ -157,14 +177,15 @@ def get_standings(players, results, rounds, pod_size=8, this_round=None, minimis
         if pod_sizes[pod_num] % 2 == 1:
             min_overall_ranking  = standings[standings[:,POD]==pod_num][:,WINS].min()
             min_pod_ranking      = standings[standings[:,POD]==pod_num][:,PODW].min()
-            min_pod_tiebreak     = standings[standings[:,POD]==pod_num][:,TBRK].min()
+            min_pod_tiebreak     = standings[standings[:,POD]==pod_num][:,CTB].min()
             byes.append(['BYE' + str(pod_num), min_overall_ranking-1, min_pod_tiebreak, pod_num, min_pod_ranking-1])
 
     if len(byes) > 0:
         byes = np.array(byes, dtype=object)
         standings = np.vstack([standings, byes])
 
-    standings = sort(standings, [TBRK, WINS, POD], [1, -1, 1], preshuffle=True)
+    standings = sorted(standings, key=lambda x: [x[POD], -x[WINS], -x[CTB], x[PML], x[OML], -x[OCTB]])
+    standings = np.array(standings)
 
     return standings
 
@@ -233,7 +254,7 @@ def get_scores(standings, results, rounds, minimiseTiebreakDist=False):
 
     # Subtract points for different number of in-format wins
     if minimiseTiebreakDist:
-        tiebreak_distance = 1 + 1e-4 - (np.abs(standings[:,[TBRK]] - standings[:,[TBRK]].T).astype(np.float32))
+        tiebreak_distance = 1 + 1e-4 - (np.abs(standings[:,[CTB]] - standings[:,[CTB]].T).astype(np.float32))
         scores += Points.tiebreak_distance  * -np.log(tiebreak_distance) * 25
 
     return scores
@@ -513,7 +534,7 @@ def get_splits(standings):
     n_pods    = len(set(standings[:,POD]))
 
     # Sort standings by bracket and player wins
-    standings = sort(standings, [TBRK, WINS, POD], [1, -1, 1])
+    standings = sort(standings, [CTB, WINS, POD], [1, -1, 1])
 
     # Calculate splits
     if n_pods > 1:
