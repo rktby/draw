@@ -2,7 +2,7 @@
 """
 __author__ = 'Chris Pearce'
 __company__ =  'Technical Division'
-__date__ = '22 August 2019'
+__date__ = '28 March 2022'
 
 
 import numpy as np
@@ -32,6 +32,7 @@ PODW = 4
 PML  = 5
 OML  = 6
 OCTB = 7
+RPLD = 8 # No of rounds played (ex byes)
 
 def create_draw(players, results, rounds, mode='production', pod_size=8, minimiseTiebreakDist=False, seed=231):
     """
@@ -66,6 +67,7 @@ def create_draw(players, results, rounds, mode='production', pod_size=8, minimis
         np.random.seed(seed=seed)
     
     n_players = len(players)
+    results = [] if results == None else results
 
     standings               = get_standings(players, results, rounds, pod_size)
     scores                  = get_scores(standings, results, rounds, minimiseTiebreakDist)
@@ -94,6 +96,7 @@ def get_standings(players, results, rounds, pod_size=8, this_round=None, minimis
     standings: List of standings for all players still in the tournament
         (n x 3) list containing [player_id, player_wins, player_pod]
     """
+    results = [] if results == None else results
     if this_round == None:
         this_round  = 0 if len(results) == 0 else np.array(results)[:,3].astype(int).max() + 1
     last_round        = this_round - 1
@@ -125,7 +128,7 @@ def get_standings(players, results, rounds, pod_size=8, this_round=None, minimis
     w = 0.25 ** np.arange(max(1, this_round))
     w = w.cumsum()[::-1]
 
-    standings = np.zeros((len(active_players), 8), dtype=object)
+    standings = np.zeros((len(active_players), 9), dtype=object)
     for n, p in enumerate(active_players):
         id_to_pos[p] = n
         standings[n,PID]  = p
@@ -135,13 +138,20 @@ def get_standings(players, results, rounds, pod_size=8, this_round=None, minimis
         # Calculate player match loss (PML)
         standings[n,PML] = (loss_history[p]).mean()
 
-    # Calculate opponent match loss (OML)
+    # Calculate opponent match loss (OML) and opponent cumulative tiebreak (OCTB)
     for result in results:
-        player1, player2 = id_to_pos[result[0]], id_to_pos[result[1]]
-        standings[player1, OML]  += standings[player2, PML] / this_round
-        standings[player2, OML]  += standings[player1, PML] / this_round
-        standings[player1, OCTB] += standings[player2, CTB] / this_round
-        standings[player2, OCTB] += standings[player1, CTB] / this_round
+        if (result[0][:3] != 'BYE') & (result[1][:3] != 'BYE'):
+            player1, player2 = id_to_pos[result[0]], id_to_pos[result[1]]
+            standings[player1, OML]  += standings[player2, PML]
+            standings[player2, OML]  += standings[player1, PML]
+            standings[player1, OCTB] += standings[player2, CTB]
+            standings[player2, OCTB] += standings[player1, CTB]
+            standings[player1, RPLD] += 1
+            standings[player2, RPLD] += 1
+
+    for standing in standings:
+        standing[OML]  /= max(standing[RPLD], 1e-12)
+        standing[OCTB] /= max(standing[RPLD], 1e-12)
 
     standings = sorted(standings, key=lambda x: [-x[WINS], -x[CTB], x[PML], x[OML], -x[OCTB]])
     standings = np.array(standings)
@@ -178,7 +188,7 @@ def get_standings(players, results, rounds, pod_size=8, this_round=None, minimis
             min_overall_ranking  = standings[standings[:,POD]==pod_num][:,WINS].min()
             min_pod_ranking      = standings[standings[:,POD]==pod_num][:,PODW].min()
             min_pod_tiebreak     = standings[standings[:,POD]==pod_num][:,CTB].min()
-            byes.append(['BYE' + str(pod_num), min_overall_ranking-1, min_pod_tiebreak, pod_num, min_pod_ranking-1])
+            byes.append(['BYE' + str(pod_num), min_overall_ranking-1, min_pod_tiebreak, pod_num, min_pod_ranking-1, 1, 1, 0, 0])
 
     if len(byes) > 0:
         byes = np.array(byes, dtype=object)
@@ -208,6 +218,8 @@ def get_scores(standings, results, rounds, minimiseTiebreakDist=False):
     scores: Matrix containing the scores for all possible pairings
         (n x n) matrix of floats
     """
+    results = [] if results == None else results
+    
     # Get player data
     n_players = len(standings)
     ix = {player_id: pos for pos, player_id in enumerate(standings[:,PID])}
